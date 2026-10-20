@@ -1,372 +1,492 @@
-"""Modak MMO world boss overlay. OCR reads user-selected map countdown rectangles."""
-import json, os, re, time, threading, queue, tkinter as tk
-import sys
+"""MODAK boss timer 2.0 — independent Windows overlay, screen OCR, diagnostics.
+Run with Python or package using the existing PyInstaller workflow.
+"""
+import json
+import os
+import queue
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import traceback
-from tkinter import ttk, messagebox, simpledialog
+from collections import Counter
 from pathlib import Path
+import tkinter as tk
+from tkinter import messagebox, simpledialog
 
-try:
-    import mss
-    from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageTk
-    import pytesseract
-except ImportError:
-    pytesseract = None
+import mss
+from PIL import Image, ImageOps, ImageEnhance, ImageTk
 
-OCR_DATA_DIR = None
-OCR_CONFIG = '--psm 7 -l eng -c tessedit_char_whitelist=0123456789:'
-if pytesseract is not None:
-    # PyInstaller onedir: sys._MEIPASS normally points to the _internal folder.
-    roots = [Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))]
-    if getattr(sys, 'frozen', False):
-        roots += [Path(sys.executable).resolve().parent / '_internal',
-                  Path(sys.executable).resolve().parent]
-    candidates = [root / 'Tesseract-OCR' / 'tesseract.exe' for root in roots]
-    which = shutil.which('tesseract')
-    if which:
-        candidates.append(Path(which))
-    candidates += [Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
-                   Path(r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe')]
-    for executable in candidates:
-        if executable.is_file():
-            pytesseract.pytesseract.tesseract_cmd = str(executable)
-            data_dir = executable.parent / 'tessdata'
-            if (data_dir / 'eng.traineddata').is_file():
-                OCR_DATA_DIR = data_dir
-                # Avoid inherited TESSDATA_PREFIX pointing to the wrong directory.
-                os.environ.pop('TESSDATA_PREFIX', None)
-                # Explicit --tessdata-dir works reliably with bundled Tesseract.
-                OCR_CONFIG += f' --tessdata-dir "{data_dir}"'
-            break
-
-
-# Run OCR directly to avoid pytesseract decoding errors on Windows.
-OCR_EXE = None
-if pytesseract is not None:
-    possible = Path(pytesseract.pytesseract.tesseract_cmd)
-    if possible.is_file():
-        OCR_EXE = possible
-
-def read_ocr(image, psm=7):
-    if OCR_EXE is None:
-        raise RuntimeError('Tesseract 실행 파일을 찾지 못했습니다.')
-    with tempfile.TemporaryDirectory(prefix='modak_ocr_') as tmp:
-        input_path = Path(tmp) / 'input.png'
-        output_path = Path(tmp) / 'result'
-        image.save(input_path)
-        command = [str(OCR_EXE), str(input_path), str(output_path),
-                   '-l', 'eng', '--psm', str(psm),
-                   '-c', 'tessedit_char_whitelist=0123456789:']
-        if OCR_DATA_DIR is not None:
-            command.extend(['--tessdata-dir', str(OCR_DATA_DIR)])
-        env = os.environ.copy()
-        env.pop('TESSDATA_PREFIX', None)
-        completed = subprocess.run(
-            command, capture_output=True, timeout=4, env=env,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stderr.decode('utf-8', errors='replace')[:500])
-        txt = output_path.with_suffix('.txt')
-        return txt.read_text(encoding='utf-8', errors='replace') if txt.exists() else ''
-
-def ocr_variants(original):
-    """Try top and vertically shifted text strips, preserving tiny white digits."""
-    width, height = original.size
-    # The countdown can sit at different heights over each region's icon.
-    crop_ranges = [
-        ('top48', 0, round(height * 0.48)),
-        ('shift20', round(height * 0.20), round(height * 0.63)),
-        ('shift25', round(height * 0.25), round(height * 0.70)),
-        ('top60', 0, round(height * 0.60)),
-    ]
-    for crop_name, y1, y2 in crop_ranges:
-        y1 = max(0, min(height - 1, y1))
-        y2 = max(y1 + 1, min(height, y2))
-        crop = original.crop((0, y1, width, y2))
-        gray = ImageOps.grayscale(crop)
-        # LANCZOS retains the curved shapes of tiny numbers much better
-        # than nearest-neighbor enlargement for this game's text.
-        resized = gray.resize((width * 6, (y2 - y1) * 6), Image.Resampling.LANCZOS)
-        for threshold in (200, 175, 225):
-            digits = resized.point(lambda value, t=threshold: 0 if value >= t else 255)
-            padded = Image.new('L', (digits.width + 64, digits.height + 64), 255)
-            padded.paste(digits, (32, 32))
-            yield f'{crop_name}_white{threshold}', padded
-        # Gray fallback when white-on-dark isolation fails.
-        boosted = ImageOps.autocontrast(resized)
-        padded = Image.new('L', (boosted.width + 64, boosted.height + 64), 255)
-        padded.paste(boosted, (32, 32))
-        yield f'{crop_name}_gray', padded
-
-
-def extract_countdown(raw):
-    """Accept only a real colon-delimited countdown; never infer missing digits."""
-    normalized = raw.replace('：', ':').replace(' ', '').replace('\n', '')
-    for value in re.findall(r'(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)', normalized):
-        try:
-            return seconds(value)
-        except ValueError:
-            pass
-    return None
-
-
-BASE = Path(os.getenv('APPDATA', str(Path.home()))) / 'ModakBossOverlay'
-BASE.mkdir(parents=True, exist_ok=True)
+NAMES = ['그늘숲', '초원', '황야', '협곡 진입로', '망자의 묘지',
+         '망국의 기록보관소', '잊혀진 고성 입구', '망국의 병기창']
+BASE = Path(os.environ.get('APPDATA') or Path.home()) / 'ModakBossOverlay'
 CONFIG = BASE / 'config.json'
-DEFAULT_NAMES = ['그늘숲','초원','황야','협곡 진입로','망자의 묘지','망국의 기록보관소','잊혀진 고성 입구','망국의 병기창']
+DIAG = BASE / 'ocr_diagnostics'
+BG = '#17212b'
+FG = '#e7f1fa'
 
-def seconds(text):
+
+def locate_tesseract():
+    root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+    exe_dir = Path(sys.executable).resolve().parent
+    candidates = [root / 'Tesseract-OCR' / 'tesseract.exe',
+                  exe_dir / '_internal' / 'Tesseract-OCR' / 'tesseract.exe',
+                  exe_dir / 'Tesseract-OCR' / 'tesseract.exe',
+                  Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
+                  Path(r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe')]
+    system = shutil.which('tesseract')
+    if system:
+        candidates.append(Path(system))
+    for candidate in candidates:
+        if candidate.is_file():
+            data = candidate.parent / 'tessdata'
+            return candidate, data if (data / 'eng.traineddata').is_file() else None
+    return None, None
+
+
+def parse_time(text):
     text = text.strip().replace('：', ':')
     if not re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2})?', text):
-        raise ValueError('MM:SS 또는 HH:MM:SS 형식으로 입력하세요.')
-    vals = [int(x) for x in text.split(':')]
-    if any(v >= 60 for v in vals[1:]):
-        raise ValueError('분/초는 0~59여야 합니다.')
-    return vals[0]*60+vals[1] if len(vals)==2 else vals[0]*3600+vals[1]*60+vals[2]
+        raise ValueError('MM:SS 또는 HH:MM:SS로 입력하세요.')
+    parts = list(map(int, text.split(':')))
+    if any(x >= 60 for x in parts[1:]):
+        raise ValueError('분과 초는 00~59여야 합니다.')
+    return parts[0] * 60 + parts[1] if len(parts) == 2 else parts[0] * 3600 + parts[1] * 60 + parts[2]
 
-def fmt(n):
-    n = max(0, int(n))
-    h, rem = divmod(n,3600); m,s=divmod(rem,60)
-    return f'{h:02d}:{m:02d}:{s:02d}' if h else f'{m:02d}:{s:02d}'
+
+def format_time(value):
+    value = max(0, int(value))
+    hours, rem = divmod(value, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f'{hours:02}:{minutes:02}:{seconds:02}' if hours else f'{minutes:02}:{seconds:02}'
+
+
+def extract_times(raw):
+    normalized = re.sub(r'\s+', '', raw).replace('：', ':')
+    found = []
+    for match in re.finditer(r'(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)', normalized):
+        try:
+            found.append((match.group(), parse_time(match.group())))
+        except ValueError:
+            pass
+    return found
+
+
+def ocr_image(image, executable, data_dir, psm=7):
+    # Use ASCII-only temp paths, avoiding Windows console encoding problems.
+    with tempfile.TemporaryDirectory(prefix='modak_') as temp:
+        src = Path(temp) / 'image.png'
+        dst = Path(temp) / 'output'
+        image.save(src)
+        cmd = [str(executable), str(src), str(dst), '-l', 'eng',
+               '--psm', str(psm), '-c', 'tessedit_char_whitelist=0123456789:']
+        if data_dir:
+            cmd += ['--tessdata-dir', str(data_dir)]
+        env = os.environ.copy()
+        env.pop('TESSDATA_PREFIX', None)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=6, env=env,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if proc.returncode:
+            raise RuntimeError(proc.stderr.decode('utf-8', errors='replace')[-400:])
+        output = dst.with_suffix('.txt')
+        return output.read_text(encoding='utf-8', errors='replace') if output.exists() else ''
+
+
+def variants(original):
+    """Search several vertical bands and color thresholds; no guessed colons."""
+    w, h = original.size
+    bands = [('top', 0, .52), ('middle', .15, .73),
+             ('lower', .27, .88), ('whole', 0, 1)]
+    for label, start, end in bands:
+        top = min(h-1, int(h*start))
+        bottom = max(top+1, min(h, int(h*end)))
+        gray = ImageOps.grayscale(original.crop((0, top, w, bottom)))
+        zoom = gray.resize((max(120, w*6), max(60, (bottom-top)*6)), Image.Resampling.LANCZOS)
+        for threshold in (200, 175, 225):
+            # Tesseract prefers dark letters on a white background.
+            image = zoom.point(lambda v, t=threshold: 0 if v >= t else 255)
+            padded = Image.new('L', (image.width+40, image.height+40), 255)
+            padded.paste(image, (20, 20))
+            yield f'{label}_white{threshold}', padded
+        if label in ('middle', 'whole'):
+            image = ImageOps.autocontrast(zoom)
+            padded = Image.new('L', (image.width+40, image.height+40), 255)
+            padded.paste(image, (20, 20))
+            yield f'{label}_gray', padded
+
+
+def recognize(original, executable, data_dir):
+    """Return seconds or None, plus diagnostics. Prefer independently repeated readings."""
+    votes = Counter()
+    traces = []
+    best_preview = None
+    # First pass: prioritize the proven high-contrast white-digit approach.
+    for index, (name, image) in enumerate(variants(original)):
+        if best_preview is None:
+            best_preview = image.copy()
+        try:
+            raw = ocr_image(image, executable, data_dir)
+            candidates = extract_times(raw)
+            traces.append(f'{name} psm7: {raw.strip()!r}')
+            # One vote per image variant, even if OCR duplicates a time.
+            for _, seconds in set(candidates):
+                votes[seconds] += 1
+        except Exception as exc:
+            traces.append(f'{name}: 오류 {exc}')
+        # Stop early if multiple distinct preprocessing views agree.
+        if votes and votes.most_common(1)[0][1] >= 2:
+            leader, count = votes.most_common(1)[0]
+            runner_up = votes.most_common(2)[1][1] if len(votes) > 1 else 0
+            if count > runner_up:
+                return leader, traces, best_preview
+    # A single valid reading is useful when other variants cannot see tiny text,
+    # but mark it as unconfirmed in diagnostics and require no competing reading.
+    if len(votes) == 1:
+        result = next(iter(votes))
+        traces.append('주의: 단일 시간 후보 (다른 전처리에서 교차 검증되지 않음)')
+        return result, traces, best_preview
+    if votes:
+        traces.append(f'충돌하는 후보: {dict(votes)} — 기존 시간 유지')
+    return None, traces, best_preview
+
 
 class App:
     def __init__(self, root):
-        self.root=root; root.title('MODAK BOSS TIMER - OCR v6'); root.attributes('-topmost', True)
-        self.data=self.load(); self.rows={}; self.queue=queue.Queue(); self.scanning=False
-        self.alpha=self.data.get('alpha',0.91); root.attributes('-alpha',self.alpha)
-        root.geometry(self.data.get('geometry','370x480+70+80'))
-        root.configure(bg='#17212b')
-        self.make_ui(); self.render(); self.tick()
-        root.protocol('WM_DELETE_WINDOW',self.close)
+        self.root = root
+        root.title('MODAK BOSS TIMER 2')
+        root.configure(bg=BG)
+        root.attributes('-topmost', True)
+        self.data = self.load()
+        self.alpha = float(self.data.get('alpha', .94))
+        root.attributes('-alpha', self.alpha)
+        root.geometry(self.data.get('geometry', '390x540+80+80'))
+        self.rows = {}
+        self.events = queue.Queue()
+        self.busy = False
+        self.build_ui()
+        self.draw_rows()
+        root.protocol('WM_DELETE_WINDOW', self.close)
+        root.after(200, self.tick)
 
     def load(self):
-        try: return json.loads(CONFIG.read_text(encoding='utf-8'))
-        except Exception: return {'bosses':[{'name':n,'end':None,'rect':None} for n in DEFAULT_NAMES], 'alpha':0.91}
+        try:
+            data = json.loads(CONFIG.read_text(encoding='utf-8'))
+            if isinstance(data.get('bosses'), list):
+                return data
+        except (OSError, ValueError, TypeError):
+            pass
+        return {'bosses': [{'name': name, 'end': None, 'rect': None} for name in NAMES],
+                'alpha': .94}
 
     def save(self):
-        self.data['alpha']=self.alpha; self.data['geometry']=self.root.geometry()
-        CONFIG.write_text(json.dumps(self.data,ensure_ascii=False,indent=2),encoding='utf-8')
+        BASE.mkdir(parents=True, exist_ok=True)
+        self.data['alpha'] = self.alpha
+        self.data['geometry'] = self.root.geometry()
+        CONFIG.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    def make_ui(self):
-        head=tk.Frame(self.root,bg='#17212b'); head.pack(fill='x',padx=10,pady=(10,3))
-        tk.Label(head,text='⚔ MODAK BOSS TIMER',bg='#17212b',fg='#e9f2fc',font=('Malgun Gothic',12,'bold')).pack(side='left')
-        tk.Button(head,text='−',command=self.minimize,width=3).pack(side='right')
-        bar=tk.Frame(self.root,bg='#17212b');bar.pack(fill='x',padx=9,pady=5)
-        for label,command in [('영역 지정',self.select_region),('화면 동기화',self.scan),('직접 입력',self.manual),('지역 추가',self.add)]:
-            tk.Button(bar,text=label,command=command,font=('Malgun Gothic',8)).pack(side='left',padx=2)
-        self.status=tk.Label(self.root,text='지도 화면에서 영역 지정 후 화면 동기화를 눌러주세요.',bg='#17212b',fg='#9cb1c6',font=('Malgun Gothic',9),wraplength=345)
-        self.status.pack(fill='x',padx=10)
-        frame=tk.Frame(self.root,bg='#17212b');frame.pack(fill='both',expand=True,padx=8,pady=6)
-        self.canvas=tk.Canvas(frame,bg='#17212b',highlightthickness=0)
-        sb=tk.Scrollbar(frame,orient='vertical',command=self.canvas.yview)
-        self.inner=tk.Frame(self.canvas,bg='#17212b')
-        self.inner.bind('<Configure>',lambda e:self.canvas.configure(scrollregion=self.canvas.bbox('all')))
-        self.canvas.create_window((0,0),window=self.inner,anchor='nw')
-        self.canvas.configure(yscrollcommand=sb.set)
-        self.canvas.pack(side='left',fill='both',expand=True);sb.pack(side='right',fill='y')
-        bottom=tk.Frame(self.root,bg='#17212b');bottom.pack(fill='x',padx=10,pady=7)
-        tk.Label(bottom,text='투명도',bg='#17212b',fg='white').pack(side='left')
-        tk.Scale(bottom,from_=45,to=100,orient='horizontal',showvalue=False,command=self.opacity,length=110,bg='#17212b',highlightthickness=0).pack(side='left')
-        tk.Button(bottom,text='설정 저장',command=self.save).pack(side='right')
+    def build_ui(self):
+        header = tk.Frame(self.root, bg=BG)
+        header.pack(fill='x', padx=10, pady=(10, 4))
+        tk.Label(header, text='⚔ MODAK BOSS TIMER 2', bg=BG, fg=FG,
+                 font=('Malgun Gothic', 12, 'bold')).pack(side='left')
+        tk.Button(header, text='−', command=self.root.iconify, width=3).pack(side='right')
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(fill='x', padx=8, pady=4)
+        for label, fn in [('영역 지정', self.choose_region), ('화면 동기화', self.sync),
+                          ('직접 입력', self.manual), ('지역 추가', self.add)]:
+            tk.Button(bar, text=label, command=fn,
+                      font=('Malgun Gothic', 8)).pack(side='left', padx=2)
+        self.status = tk.Label(self.root, bg=BG, fg='#a7c5d9', wraplength=365,
+                               text='월드맵을 열고 화면 동기화를 눌러주세요.',
+                               font=('Malgun Gothic', 9), justify='left')
+        self.status.pack(fill='x', padx=10, pady=(2, 4))
+        panel = tk.Frame(self.root, bg=BG)
+        panel.pack(fill='both', expand=True, padx=8)
+        self.canvas = tk.Canvas(panel, bg=BG, highlightthickness=0)
+        scroll = tk.Scrollbar(panel, orient='vertical', command=self.canvas.yview)
+        self.list_frame = tk.Frame(self.canvas, bg=BG)
+        self.list_frame.bind('<Configure>', lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
+        self.canvas.create_window((0, 0), window=self.list_frame, anchor='nw')
+        self.canvas.configure(yscrollcommand=scroll.set)
+        self.canvas.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+        footer = tk.Frame(self.root, bg=BG)
+        footer.pack(fill='x', padx=10, pady=8)
+        tk.Label(footer, text='투명도', bg=BG, fg=FG).pack(side='left')
+        scale = tk.Scale(footer, from_=45, to=100, orient='horizontal',
+                         showvalue=False, bg=BG, highlightthickness=0,
+                         length=125, command=self.opacity)
+        scale.set(round(self.alpha*100))
+        scale.pack(side='left')
+        tk.Button(footer, text='설정 저장', command=self.save).pack(side='right')
 
-    def opacity(self,v):
-        self.alpha=int(v)/100; self.root.attributes('-alpha',self.alpha)
+    def opacity(self, value):
+        self.alpha = int(value)/100
+        self.root.attributes('-alpha', self.alpha)
 
-    def render(self):
-        for w in self.inner.winfo_children(): w.destroy()
-        self.rows={}
-        for i,b in enumerate(self.data['bosses']):
-            line=tk.Frame(self.inner,bg='#233140',padx=8,pady=7);line.pack(fill='x',pady=2)
-            tk.Label(line,text=b['name'],fg='#eef4fc',bg='#233140',font=('Malgun Gothic',10),anchor='w').pack(side='left',fill='x',expand=True)
-            lbl=tk.Label(line,text='미확인',fg='#9bb2c7',bg='#233140',font=('Consolas',12,'bold'))
-            lbl.pack(side='right');self.rows[i]=lbl
-            line.bind('<Button-3>',lambda e,j=i:self.context(e,j))
-            for w in line.winfo_children():w.bind('<Button-3>',lambda e,j=i:self.context(e,j))
+    def draw_rows(self):
+        for child in self.list_frame.winfo_children():
+            child.destroy()
+        self.rows.clear()
+        for index, boss in enumerate(self.data['bosses']):
+            frame = tk.Frame(self.list_frame, bg='#233140', padx=8, pady=7)
+            frame.pack(fill='x', pady=2)
+            label = tk.Label(frame, text=boss['name'], fg=FG, bg='#233140',
+                             font=('Malgun Gothic', 10), anchor='w')
+            label.pack(side='left', fill='x', expand=True)
+            countdown = tk.Label(frame, text='미확인', fg='#b0c2d0', bg='#233140',
+                                  font=('Consolas', 12, 'bold'))
+            countdown.pack(side='right')
+            self.rows[index] = countdown
+            for widget in (frame, label, countdown):
+                widget.bind('<Button-3>', lambda event, i=index: self.menu(event, i))
 
-    def context(self,e,i):
-        menu=tk.Menu(self.root,tearoff=0)
-        menu.add_command(label='시간 직접 입력',command=lambda:self.manual(i))
-        menu.add_command(label='인식 영역 재지정',command=lambda:self.select_region(i))
-        menu.add_command(label='지역 이름 변경',command=lambda:self.rename(i))
-        menu.add_command(label='지역 삭제',command=lambda:self.delete(i))
-        menu.tk_popup(e.x_root,e.y_root)
+    def menu(self, event, index):
+        popup = tk.Menu(self.root, tearoff=0)
+        popup.add_command(label='시간 직접 입력', command=lambda: self.manual(index))
+        popup.add_command(label='인식 영역 재지정', command=lambda: self.choose_region(index))
+        popup.add_command(label='지역 이름 변경', command=lambda: self.rename(index))
+        popup.add_command(label='지역 삭제', command=lambda: self.delete(index))
+        try:
+            popup.tk_popup(event.x_root, event.y_root)
+        finally:
+            popup.grab_release()
 
-    def rename(self,i):
-        b=self.data['bosses'][i];name=simpledialog.askstring('이름 변경','지역 이름:',initialvalue=b['name'],parent=self.root)
-        if name: b['name']=name.strip();self.render();self.save()
+    def choose_index(self, prompt):
+        names = [boss['name'] for boss in self.data['bosses']]
+        name = simpledialog.askstring('지역 선택', prompt + '\n' + ', '.join(names), parent=self.root)
+        if not name:
+            return None
+        if name.strip() not in names:
+            messagebox.showerror('오류', '지역 이름을 정확히 입력해 주세요.')
+            return None
+        return names.index(name.strip())
 
-    def delete(self,i):
-        if messagebox.askyesno('삭제',self.data['bosses'][i]['name']+' 지역을 삭제할까요?'):
-            self.data['bosses'].pop(i);self.render();self.save()
+    def manual(self, index=None):
+        if index is None:
+            index = self.choose_index('시간을 입력할 지역 이름:')
+        if index is None:
+            return
+        boss = self.data['bosses'][index]
+        value = simpledialog.askstring('남은 시간', boss['name']+' (MM:SS 또는 HH:MM:SS)', parent=self.root)
+        if value is None:
+            return
+        try:
+            boss['end'] = time.time() + parse_time(value)
+        except ValueError as exc:
+            messagebox.showerror('입력 오류', str(exc))
+            return
+        self.status.config(text=boss['name']+' 수동 입력 완료')
+        self.save()
 
     def add(self):
-        name=simpledialog.askstring('지역 추가','지역 이름:',parent=self.root)
-        if name: self.data['bosses'].append({'name':name.strip(),'end':None,'rect':None});self.render();self.save()
+        name = simpledialog.askstring('지역 추가', '지역 이름:', parent=self.root)
+        if name and name.strip():
+            self.data['bosses'].append({'name': name.strip(), 'end': None, 'rect': None})
+            self.draw_rows()
+            self.save()
 
-    def manual(self,i=None):
-        if i is None:
-            names=[b['name'] for b in self.data['bosses']]
-            name=simpledialog.askstring('지역 선택','지역 이름을 입력하세요:\n'+', '.join(names),parent=self.root)
-            if not name:return
-            try:i=names.index(name.strip())
-            except ValueError:messagebox.showerror('오류','지역 이름을 정확히 입력하세요.');return
-        b=self.data['bosses'][i]
-        v=simpledialog.askstring('남은 시간',b['name']+' 남은 시간 (MM:SS 또는 HH:MM:SS)',parent=self.root)
-        if v is None:return
-        try:b['end']=time.time()+seconds(v)
-        except ValueError as ex:messagebox.showerror('입력 오류',str(ex));return
-        self.status.config(text=b['name']+' 수동 입력 완료');self.save()
+    def rename(self, index):
+        boss = self.data['bosses'][index]
+        name = simpledialog.askstring('이름 변경', '새 지역 이름:',
+                                       initialvalue=boss['name'], parent=self.root)
+        if name and name.strip():
+            boss['name'] = name.strip()
+            self.draw_rows()
+            self.save()
 
-    def select_region(self,i=None):
-        if i is None:
-            names=[b['name'] for b in self.data['bosses']]
-            name=simpledialog.askstring('지역 선택','영역을 지정할 지역 이름:\n'+', '.join(names),parent=self.root)
-            if not name:return
-            try:i=names.index(name.strip())
-            except ValueError:messagebox.showerror('오류','지역 이름을 정확히 입력하세요.');return
-        self.root.withdraw();self.root.after(450,lambda:self.region_window(i))
+    def delete(self, index):
+        if messagebox.askyesno('삭제', self.data['bosses'][index]['name']+' 지역을 삭제할까요?'):
+            self.data['bosses'].pop(index)
+            self.draw_rows()
+            self.save()
 
-    def region_window(self,i):
+    def choose_region(self, index=None):
+        if self.busy:
+            self.status.config(text='동기화 중에는 영역을 변경할 수 없습니다.')
+            return
+        if index is None:
+            index = self.choose_index('영역을 지정할 지역 이름:')
+        if index is None:
+            return
+        self.root.withdraw()
+        self.root.after(350, lambda: self.region_window(index))
+
+    def region_window(self, index):
         try:
             with mss.mss() as sct:
-                monitor=sct.monitors[0];shot=sct.grab(monitor)
-            im=Image.frombytes('RGB',shot.size,shot.rgb)
-            win=tk.Toplevel(self.root);win.overrideredirect(True);win.attributes('-topmost',True)
-            win.geometry(f'{im.width}x{im.height}+{monitor["left"]}+{monitor["top"]}')
-            photo=ImageTk.PhotoImage(im)
-            c=tk.Canvas(win,width=im.width,height=im.height,highlightthickness=0,cursor='crosshair')
-            c.pack();c.create_image(0,0,image=photo,anchor='nw');c.image=photo
-            c.create_text(20,20,anchor='nw',text='시간 숫자만 드래그하여 선택하세요 (ESC 취소)',fill='yellow',font=('Malgun Gothic',15,'bold'))
-            state={'start':None,'rect':None}
-            def down(e):
-                state['start']=(e.x,e.y)
-                state['rect']=c.create_rectangle(e.x,e.y,e.x,e.y,outline='#ffdc50',width=3)
-            def move(e):
-                if state['start']:c.coords(state['rect'],*state['start'],e.x,e.y)
-            def done(e):
-                if state['start']:
-                    x1,y1=state['start'];x2,y2=e.x,e.y
-                    if abs(x2-x1)>8 and abs(y2-y1)>8:
-                        self.data['bosses'][i]['rect']=[min(x1,x2)+monitor['left'],min(y1,y2)+monitor['top'],abs(x2-x1),abs(y2-y1)]
-                        self.save();self.status.config(text=self.data['bosses'][i]['name']+' 인식 영역 저장됨')
-                win.destroy();self.root.deiconify()
-            c.bind('<ButtonPress-1>',down);c.bind('<B1-Motion>',move);c.bind('<ButtonRelease-1>',done)
-            win.bind('<Escape>',lambda e:(win.destroy(),self.root.deiconify()))
-        except Exception as ex:self.root.deiconify();messagebox.showerror('캡처 오류',str(ex))
+                screen = sct.monitors[0]
+                shot = sct.grab(screen)
+            image = Image.frombytes('RGB', shot.size, shot.rgb)
+            window = tk.Toplevel(self.root)
+            window.overrideredirect(True)
+            window.attributes('-topmost', True)
+            window.geometry(f'{image.width}x{image.height}+{screen["left"]}+{screen["top"]}')
+            photo = ImageTk.PhotoImage(image)
+            canvas = tk.Canvas(window, width=image.width, height=image.height,
+                               highlightthickness=0, cursor='crosshair')
+            canvas.pack()
+            canvas.create_image(0, 0, image=photo, anchor='nw')
+            canvas.image = photo
+            canvas.create_text(18, 18, anchor='nw', fill='yellow',
+                               font=('Malgun Gothic', 14, 'bold'),
+                               text='숫자 전체를 드래그하세요 (ESC 취소)')
+            drag = {'start': None, 'shape': None}
 
-    def scan(self):
-        # Always acknowledge a button press immediately.
-        if self.scanning:
-            self.status.config(text='이미 화면 인식이 진행 중입니다. 잠시 기다려 주세요.')
+            def close():
+                window.destroy()
+                self.root.deiconify()
+
+            def down(event):
+                drag['start'] = (event.x, event.y)
+                drag['shape'] = canvas.create_rectangle(event.x, event.y, event.x, event.y,
+                                                         outline='yellow', width=2)
+
+            def move(event):
+                if drag['start']:
+                    canvas.coords(drag['shape'], *drag['start'], event.x, event.y)
+
+            def up(event):
+                if drag['start']:
+                    x, y = drag['start']
+                    left, top = min(x, event.x), min(y, event.y)
+                    width, height = abs(x-event.x), abs(y-event.y)
+                    if width >= 10 and height >= 10:
+                        self.data['bosses'][index]['rect'] = [left+screen['left'],
+                                                             top+screen['top'], width, height]
+                        self.save()
+                        self.status.config(text=self.data['bosses'][index]['name']+' 영역 저장 완료')
+                close()
+
+            canvas.bind('<ButtonPress-1>', down)
+            canvas.bind('<B1-Motion>', move)
+            canvas.bind('<ButtonRelease-1>', up)
+            window.bind('<Escape>', lambda _event: close())
+        except Exception as exc:
+            self.root.deiconify()
+            messagebox.showerror('화면 캡처 오류', str(exc))
+
+    def sync(self):
+        if self.busy:
+            self.status.config(text='이미 동기화 중입니다. 잠시 기다려 주세요.')
             return
-        targets = [(i, b['rect'], b['name']) for i, b in enumerate(self.data['bosses']) if b.get('rect')]
-        if not targets:
-            self.status.config(text='먼저 지역별 시간 숫자 영역을 지정하세요.')
-            return
-        if OCR_EXE is None:
+        executable, data_dir = locate_tesseract()
+        if executable is None:
             self.status.config(text='Tesseract OCR 실행 파일을 찾지 못했습니다.')
             messagebox.showerror('OCR 오류', 'Tesseract 실행 파일을 찾지 못했습니다.')
             return
-        self.scanning = True
-        self.status.config(text=f'시간 인식 중... (0/{len(targets)})')
-        self.root.update_idletasks()
+        targets = [(i, tuple(map(int, boss['rect'])), boss['name'])
+                   for i, boss in enumerate(self.data['bosses']) if boss.get('rect')]
+        if not targets:
+            self.status.config(text='먼저 영역 지정을 해 주세요.')
+            return
+        self.busy = True
+        self.status.config(text='지도 캡처 중...')
+        # Hide overlay while capturing, so it cannot obscure a boss timer.
+        self.root.withdraw()
+        self.root.after(300, lambda: self.capture_and_scan(targets, executable, data_dir))
 
-        def work():
-            results = []
-            diagnostics = []
-            diag_dir = BASE / 'ocr_diagnostics'
+    def capture_and_scan(self, targets, executable, data_dir):
+        try:
+            captures = []
+            with mss.mss() as sct:
+                for index, rect, name in targets:
+                    x, y, w, h = rect
+                    if w <= 0 or h <= 0:
+                        captures.append((index, name, rect, None, '잘못된 영역 크기'))
+                        continue
+                    shot = sct.grab({'left': x, 'top': y, 'width': w, 'height': h})
+                    captures.append((index, name, rect,
+                                     Image.frombytes('RGB', shot.size, shot.rgb), None))
+            captured_at = time.time()
+            self.root.deiconify()
+            self.status.config(text=f'시간 인식 중... 0/{len(captures)}개 처리')
+            threading.Thread(target=self.worker,
+                             args=(captures, executable, data_dir, captured_at),
+                             daemon=True).start()
+        except Exception as exc:
+            self.root.deiconify()
+            self.busy = False
+            self.status.config(text='캡처 오류: '+str(exc))
+
+    def worker(self, captures, executable, data_dir, captured_at):
+        results = []
+        reports = ['모닥 월드보스 OCR 2.0 진단', '']
+        try:
+            DIAG.mkdir(parents=True, exist_ok=True)
+            for position, (index, name, rect, image, error) in enumerate(captures, 1):
+                if error:
+                    results.append((index, None))
+                    reports.append(f'{name} | 영역 {rect} | 오류 {error}\n')
+                else:
+                    image.save(DIAG / f'{index+1:02d}_original.png')
+                    seconds, lines, preview = recognize(image, executable, data_dir)
+                    if preview is not None:
+                        preview.save(DIAG / f'{index+1:02d}_processed.png')
+                    results.append((index, seconds))
+                    reports.append(f'{name} | 영역 {rect} | 인식: {seconds is not None}')
+                    reports.extend(lines)
+                    reports.append('')
+                self.events.put(('progress', position, len(captures)))
+            (DIAG / 'ocr_report.txt').write_text('\n'.join(reports), encoding='utf-8')
+            self.events.put(('complete', results, captured_at))
+        except Exception:
+            error = traceback.format_exc()
             try:
-                diag_dir.mkdir(parents=True, exist_ok=True)
-                with mss.mss() as sct:
-                    for number, (i, rect, name) in enumerate(targets, start=1):
-                        try:
-                            x, y, w, h = [int(v) for v in rect]
-                            if w <= 0 or h <= 0:
-                                raise ValueError(f'잘못된 영역 크기: {rect}')
-                            shot = sct.grab({'left': x, 'top': y, 'width': w, 'height': h})
-                            captured_at = time.time()
-                            original = Image.frombytes('RGB', shot.size, shot.rgb)
-                            original.save(diag_dir / f'{i+1:02d}_original.png')
-                            variants = list(ocr_variants(original))
-                            # Save the first crop variant to inspect exactly what OCR sees.
-                            variants[0][1].save(diag_dir / f'{i+1:02d}_processed.png')
-                            attempts = []
-                            found = None
-                            for variant_name, im in variants:
-                                try:
-                                    raw = read_ocr(im, psm=7).strip()
-                                    attempts.append(f'{variant_name} psm7: {raw!r}')
-                                    found = extract_countdown(raw)
-                                    if found is not None:
-                                        break
-                                except Exception as ex:
-                                    attempts.append(f'{variant_name} psm7 오류: {ex}')
-                            # A single text line may work better as raw-line mode.
-                            if found is None:
-                                for variant_name, im in variants[:8]:
-                                    try:
-                                        raw = read_ocr(im, psm=13).strip()
-                                        attempts.append(f'{variant_name} psm13: {raw!r}')
-                                        found = extract_countdown(raw)
-                                        if found is not None:
-                                            break
-                                    except Exception as ex:
-                                        attempts.append(f'{variant_name} psm13 오류: {ex}')
-                            if found is not None:
-                                results.append((i, captured_at + found))
-                            diagnostics.append(f'{name} | 영역 {rect} | 인식: {found is not None}\n' + '\n'.join(attempts))
-                        except Exception as ex:
-                            diagnostics.append(f'{name} | 캡처 오류: {ex}')
-                        self.queue.put(('progress', number, len(targets)))
-                (diag_dir / 'ocr_report.txt').write_text(
-                    '모닥 월드보스 OCR 진단\n\n' + '\n\n'.join(diagnostics),
-                    encoding='utf-8')
-                self.queue.put(('result', results, len(targets), str(diag_dir)))
-            except Exception:
-                error = traceback.format_exc()
-                try:
-                    diag_dir.mkdir(parents=True, exist_ok=True)
-                    (diag_dir / 'error_log.txt').write_text(error, encoding='utf-8')
-                except Exception:
-                    pass
-                self.queue.put(('error', error.splitlines()[-1]))
-
-        threading.Thread(target=work, daemon=True).start()
+                DIAG.mkdir(parents=True, exist_ok=True)
+                (DIAG / 'error.txt').write_text(error, encoding='utf-8')
+            except OSError:
+                pass
+            self.events.put(('error', error.splitlines()[-1]))
 
     def tick(self):
         try:
             while True:
-                result = self.queue.get_nowait()
-                if result[0] == 'progress':
-                    self.status.config(text=f'시간 인식 중... ({result[1]}/{result[2]})')
-                    continue
-                self.scanning = False
-                if result[0] == 'error':
-                    self.status.config(text='인식 실패: ' + result[1])
-                    continue
-                _, values, total, diag_dir = result
-                for i, end_time in values:
-                    self.data['bosses'][i]['end'] = end_time
-                self.status.config(text=f'동기화 완료: {len(values)}/{total}개 인식. 진단: {diag_dir}', wraplength=345)
-                self.save()
+                event = self.events.get_nowait()
+                if event[0] == 'progress':
+                    self.status.config(text=f'시간 인식 중... {event[1]}/{event[2]}개 처리')
+                elif event[0] == 'error':
+                    self.busy = False
+                    self.status.config(text='동기화 오류: '+event[1])
+                elif event[0] == 'complete':
+                    self.busy = False
+                    results, captured_at = event[1], event[2]
+                    success = 0
+                    for index, seconds in results:
+                        if seconds is not None:
+                            self.data['bosses'][index]['end'] = captured_at + seconds
+                            success += 1
+                    self.status.config(text=f'동기화 완료: {success}/{len(results)}개 인식\n진단: {DIAG}')
+                    self.save()
         except queue.Empty:
             pass
-        now=time.time()
-        for i,b in enumerate(self.data['bosses']):
-            label=self.rows.get(i)
-            if not label:continue
-            end=b.get('end')
-            if end is None:label.config(text='미확인',fg='#9bb2c7')
-            elif end<=now:label.config(text='출현 예상!',fg='#ff8c7e')
+        now = time.time()
+        for index, boss in enumerate(self.data['bosses']):
+            label = self.rows.get(index)
+            if label is None:
+                continue
+            end = boss.get('end')
+            if end is None:
+                label.config(text='미확인', fg='#a8bdcd')
+            elif end <= now:
+                label.config(text='출현 예상!', fg='#ff9186')
             else:
-                remaining=end-now
-                label.config(text=fmt(remaining),fg='#ffcd79' if remaining<=300 else '#c6e6fc')
-        self.root.after(500,self.tick)
+                remain = end-now
+                label.config(text=format_time(remain),
+                             fg='#ffd37b' if remain <= 300 else '#c7e7fc')
+        self.root.after(400, self.tick)
 
-    def minimize(self):self.root.iconify()
-    def close(self):self.save();self.root.destroy()
+    def close(self):
+        self.save()
+        self.root.destroy()
 
-if __name__=='__main__':
-    root=tk.Tk();app=App(root);root.mainloop()
+
+if __name__ == '__main__':
+    BASE.mkdir(parents=True, exist_ok=True)
+    window = tk.Tk()
+    App(window)
+    window.mainloop()
