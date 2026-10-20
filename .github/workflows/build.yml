@@ -20,24 +20,23 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller mss pillow pytesseract
-
-      - name: Download Tesseract
+      - name: Install Tesseract OCR
         shell: pwsh
         run: |
-          $url = "https://github.com/UB-Mannheim/tesseract/releases/latest"
-          Write-Host "Tesseract installer reference: $url"
+          choco install tesseract -y --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tesseract installation failed"
+          }
+          & "C:\Program Files\Tesseract-OCR\tesseract.exe" --version
 
-      - name: Build EXE
+      - name: Build portable EXE
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --onedir --name ModakBossOverlay modak_overlay.py
+          ./build_windows.ps1
 
-      - name: Upload EXE
+      - name: Upload portable program
         uses: actions/upload-artifact@v4
         with:
-          name: ModakBossOverlay-Windows
-          path: dist/ModakBossOverlay/
+          name: ModakBossOverlay-Portable
+          path: ModakBossOverlay_Windows_Portable.zip
+          if-no-files-found: error
