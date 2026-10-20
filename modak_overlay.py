@@ -11,8 +11,12 @@ try:
     import pytesseract
     bundle_dir = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
     bundled_ocr = bundle_dir / 'Tesseract-OCR' / 'tesseract.exe'
-    if bundled_ocr.is_file():
-        os.environ['TESSDATA_PREFIX'] = str(bundle_dir / 'Tesseract-OCR' / 'tessdata')
+    bundled_data = bundle_dir / 'Tesseract-OCR' / 'tessdata'
+    if bundled_ocr.is_file() and (bundled_data / 'eng.traineddata').is_file():
+        os.environ['TESSDATA_PREFIX'] = str(bundled_data)
+        OCR_DATA_DIR = bundled_data
+    else:
+        OCR_DATA_DIR = None
     candidates = [
         str(bundled_ocr),
         shutil.which('tesseract'),
@@ -22,6 +26,11 @@ try:
     for executable in candidates:
         if executable and Path(executable).is_file():
             pytesseract.pytesseract.tesseract_cmd = str(executable)
+            if OCR_DATA_DIR is None:
+                candidate_data = Path(executable).parent / 'tessdata'
+                if (candidate_data / 'eng.traineddata').is_file():
+                    OCR_DATA_DIR = candidate_data
+                    os.environ['TESSDATA_PREFIX'] = str(candidate_data)
             break
 except ImportError:
     pytesseract = None
@@ -189,14 +198,19 @@ class App:
                         im=ImageEnhance.Contrast(im).enhance(2.3)
                         candidates=[]
                         for candidate in (im,ImageOps.invert(im)):
-                            raw=pytesseract.image_to_string(candidate,config='--psm 7 -c tessedit_char_whitelist=0123456789:')
+                            raw=pytesseract.image_to_string(candidate,lang='eng',config='--psm 7 -c tessedit_char_whitelist=0123456789:' + (f' --tessdata-dir \"{OCR_DATA_DIR}\"' if OCR_DATA_DIR else ''))
                             found=re.findall(r'\d{1,2}:\d{2}(?::\d{2})?',raw)
                             for v in found:
                                 try:candidates.append(seconds(v))
                                 except ValueError:pass
                         if candidates:results.append((i,candidates[0]))
                 self.queue.put(('result',results,len(targets)))
-            except Exception as ex:self.queue.put(('error',str(ex)))
+            except Exception as ex:
+                detail = str(ex)
+                if 'TesseractError' in type(ex).__name__ or 'traineddata' in detail or 'tessdata' in detail:
+                    detail = ('OCR 실행 오류. 포함된 tessdata/eng.traineddata 파일과 OCR 실행 경로를 확인하세요. '
+                              + f'실행파일: {pytesseract.pytesseract.tesseract_cmd}; 데이터: {OCR_DATA_DIR}; 원본: {detail}')
+                self.queue.put(('error',detail))
         threading.Thread(target=work,daemon=True).start()
 
     def tick(self):
