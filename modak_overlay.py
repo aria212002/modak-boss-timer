@@ -2,41 +2,58 @@
 import json, os, re, time, threading, queue, tkinter as tk
 import sys
 import shutil
+import subprocess
+import tempfile
 from tkinter import ttk, messagebox, simpledialog
 from pathlib import Path
 
-try:
-    import mss
-    from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageTk
-    import pytesseract
-except ImportError:
-    pytesseract = None
+import mss
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageTk
 
+# Call Tesseract directly. pytesseract can raise UnicodeDecodeError while
+# decoding Tesseract's Windows stderr before its BYTES option takes effect.
+OCR_EXE = None
 OCR_DATA_DIR = None
-OCR_CONFIG = '--psm 7 -l eng -c tessedit_char_whitelist=0123456789:'
-if pytesseract is not None:
-    # PyInstaller onedir: sys._MEIPASS normally points to the _internal folder.
-    roots = [Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))]
-    if getattr(sys, 'frozen', False):
-        roots += [Path(sys.executable).resolve().parent / '_internal',
-                  Path(sys.executable).resolve().parent]
-    candidates = [root / 'Tesseract-OCR' / 'tesseract.exe' for root in roots]
-    which = shutil.which('tesseract')
-    if which:
-        candidates.append(Path(which))
-    candidates += [Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
-                   Path(r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe')]
-    for executable in candidates:
-        if executable.is_file():
-            pytesseract.pytesseract.tesseract_cmd = str(executable)
-            data_dir = executable.parent / 'tessdata'
-            if (data_dir / 'eng.traineddata').is_file():
-                OCR_DATA_DIR = data_dir
-                # Avoid inherited TESSDATA_PREFIX pointing to the wrong directory.
-                os.environ.pop('TESSDATA_PREFIX', None)
-                # Explicit --tessdata-dir works reliably with bundled Tesseract.
-                OCR_CONFIG += f' --tessdata-dir "{data_dir}"'
-            break
+roots = [Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))]
+if getattr(sys, 'frozen', False):
+    roots.extend([Path(sys.executable).resolve().parent / '_internal',
+                  Path(sys.executable).resolve().parent])
+candidates = [root / 'Tesseract-OCR' / 'tesseract.exe' for root in roots]
+which = shutil.which('tesseract')
+if which:
+    candidates.append(Path(which))
+candidates.extend([Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
+                   Path(r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe')])
+for candidate in candidates:
+    if candidate.is_file() and (candidate.parent / 'tessdata' / 'eng.traineddata').is_file():
+        OCR_EXE = candidate
+        OCR_DATA_DIR = candidate.parent / 'tessdata'
+        break
+
+def read_ocr(image):
+    if OCR_EXE is None:
+        raise RuntimeError('Tesseract OCR 또는 eng.traineddata 파일을 찾지 못했습니다.')
+    # Windows temp paths may contain non-ASCII; use the user's current
+    # temp directory, and pass argument arrays rather than quoted strings.
+    with tempfile.TemporaryDirectory(prefix='modak_ocr_') as tempdir:
+        input_path = Path(tempdir) / 'timer.png'
+        image.save(input_path, format='PNG')
+        cmd = [str(OCR_EXE), str(input_path), 'stdout',
+               '--tessdata-dir', str(OCR_DATA_DIR), '-l', 'eng', '--psm', '7',
+               '-c', 'tessedit_char_whitelist=0123456789:']
+        env = os.environ.copy()
+        env.pop('TESSDATA_PREFIX', None)
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        result = subprocess.run(cmd, capture_output=True, text=False,
+                                timeout=20, env=env, startupinfo=startupinfo)
+        if result.returncode != 0:
+            # Windows OCR binaries can emit CP949 stderr, not UTF-8.
+            message = result.stderr.decode('cp949' if os.name == 'nt' else 'utf-8', errors='replace')
+            raise RuntimeError('Tesseract 오류: ' + message[:400])
+        return result.stdout.decode('utf-8', errors='replace')
 
 BASE = Path(os.getenv('APPDATA', str(Path.home()))) / 'ModakBossOverlay'
 BASE.mkdir(parents=True, exist_ok=True)
@@ -186,8 +203,8 @@ class App:
         if self.scanning:return
         targets=[(i,b['rect']) for i,b in enumerate(self.data['bosses']) if b.get('rect')]
         if not targets:self.status.config(text='먼저 지역별 시간 숫자 영역을 지정하세요.');return
-        if pytesseract is None:
-            self.status.config(text='pytesseract 패키지가 없습니다. install.bat을 실행하세요.')
+        if OCR_EXE is None:
+            self.status.config(text='Tesseract OCR 파일을 찾지 못했습니다.')
             return
         self.scanning=True;self.status.config(text='게임 화면에서 시간 인식 중…')
         def work():
@@ -201,12 +218,7 @@ class App:
                         im=ImageEnhance.Contrast(im).enhance(2.3)
                         candidates=[]
                         for candidate in (im,ImageOps.invert(im)):
-                            # Read OCR output as bytes: some Windows Tesseract builds emit
-                            # non-UTF-8 bytes even when recognizing only digits.
-                            raw_bytes = pytesseract.image_to_string(
-                                candidate, lang='eng', config=OCR_CONFIG,
-                                output_type=pytesseract.Output.BYTES)
-                            raw = raw_bytes.decode('utf-8', errors='replace')
+                            raw = read_ocr(candidate)
                             found=re.findall(r'\d{1,2}:\d{2}(?::\d{2})?',raw)
                             for v in found:
                                 try:candidates.append(seconds(v))
@@ -215,9 +227,6 @@ class App:
                 self.queue.put(('result',results,len(targets)))
             except Exception as ex:
                 detail = str(ex)
-                if 'TesseractError' in type(ex).__name__ or 'traineddata' in detail or 'tessdata' in detail:
-                    detail = ('OCR 실행 오류. 포함된 tessdata/eng.traineddata 파일과 OCR 실행 경로를 확인하세요. '
-                              + f'실행파일: {pytesseract.pytesseract.tesseract_cmd}; 데이터: {OCR_DATA_DIR}; 원본: {detail}')
                 self.queue.put(('error',detail))
         threading.Thread(target=work,daemon=True).start()
 
