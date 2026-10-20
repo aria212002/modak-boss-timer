@@ -1,0 +1,24 @@
+name: Build MODAK Boss Timer Lite
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - modak_overlay.py
+      - .github/workflows/build-windows-lite.yml
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyInstaller only
+        run: python -m pip install --upgrade pyinstaller
+      - name: Build compact EXE (no OCR dependencies)
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name ModakBossTimer modak_overlay.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ModakBossTimer-Lite-Windows
+          path: dist/ModakBossTimer.exe
