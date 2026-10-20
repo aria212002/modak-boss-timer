@@ -71,6 +71,44 @@ def read_ocr(image, psm=7):
         txt = output_path.with_suffix('.txt')
         return txt.read_text(encoding='utf-8', errors='replace') if txt.exists() else ''
 
+def ocr_variants(original):
+    """Focus on the small countdown at the top of the boss marker."""
+    width, height = original.size
+    # In the observed game screenshot, digits occupy the top ~one third.
+    # Also try a taller crop in case the UI scale differs.
+    crops = [
+        ('top35', original.crop((0, 0, width, max(9, round(height * 0.35))))),
+        ('top50', original.crop((0, 0, width, max(12, round(height * 0.50))))),
+        ('full', original),
+    ]
+    for crop_name, crop in crops:
+        gray = ImageOps.grayscale(crop)
+        scale = 8
+        resized = gray.resize((gray.width * scale, gray.height * scale), Image.Resampling.NEAREST)
+        # Light digit interiors become dark ink on a plain white background.
+        white_ink = resized.point(lambda value: 0 if value >= 205 else 255)
+        # Reduce thin holes and gaps in tiny letters.
+        white_ink = white_ink.filter(ImageFilter.MinFilter(3))
+        dark_ink = resized.point(lambda value: 0 if value <= 85 else 255)
+        boosted = ImageOps.autocontrast(resized)
+        for kind, image in [('white_digits', white_ink), ('dark_outline', dark_ink), ('gray', boosted)]:
+            # Tesseract performs better with surrounding whitespace.
+            padded = Image.new('L', (image.width + 48, image.height + 48), 255)
+            padded.paste(image, (24, 24))
+            yield f'{crop_name}_{kind}', padded
+
+
+def extract_countdown(raw):
+    """Accept only a real colon-delimited countdown; never infer missing digits."""
+    normalized = raw.replace('：', ':').replace(' ', '').replace('\n', '')
+    for value in re.findall(r'(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)', normalized):
+        try:
+            return seconds(value)
+        except ValueError:
+            pass
+    return None
+
+
 BASE = Path(os.getenv('APPDATA', str(Path.home()))) / 'ModakBossOverlay'
 BASE.mkdir(parents=True, exist_ok=True)
 CONFIG = BASE / 'config.json'
@@ -247,31 +285,31 @@ class App:
                             shot = sct.grab({'left': x, 'top': y, 'width': w, 'height': h})
                             original = Image.frombytes('RGB', shot.size, shot.rgb)
                             original.save(diag_dir / f'{i+1:02d}_original.png')
-                            gray = ImageOps.grayscale(original)
-                            enlarged = gray.resize((max(160, w*6), max(70, h*6)), Image.Resampling.LANCZOS)
-                            processed = ImageEnhance.Contrast(enlarged).enhance(2.0)
-                            processed.save(diag_dir / f'{i+1:02d}_processed.png')
-                            variants = [('contrast', processed), ('invert', ImageOps.invert(enlarged)),
-                                        ('threshold', enlarged.point(lambda v: 255 if v >= 165 else 0))]
+                            variants = list(ocr_variants(original))
+                            # Save the first crop variant to inspect exactly what OCR sees.
+                            variants[0][1].save(diag_dir / f'{i+1:02d}_processed.png')
                             attempts = []
                             found = None
                             for variant_name, im in variants:
-                                for psm in (7, 13):
+                                try:
+                                    raw = read_ocr(im, psm=7).strip()
+                                    attempts.append(f'{variant_name} psm7: {raw!r}')
+                                    found = extract_countdown(raw)
+                                    if found is not None:
+                                        break
+                                except Exception as ex:
+                                    attempts.append(f'{variant_name} psm7 오류: {ex}')
+                            # A single text line may work better as raw-line mode.
+                            if found is None:
+                                for variant_name, im in variants[:3]:
                                     try:
-                                        raw = read_ocr(im, psm=psm).strip()
-                                        attempts.append(f'{variant_name} psm{psm}: {raw!r}')
-                                        for match in re.findall(r'(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)', raw):
-                                            try:
-                                                found = seconds(match)
-                                                break
-                                            except ValueError:
-                                                pass
+                                        raw = read_ocr(im, psm=13).strip()
+                                        attempts.append(f'{variant_name} psm13: {raw!r}')
+                                        found = extract_countdown(raw)
                                         if found is not None:
                                             break
                                     except Exception as ex:
-                                        attempts.append(f'{variant_name} psm{psm} 오류: {ex}')
-                                if found is not None:
-                                    break
+                                        attempts.append(f'{variant_name} psm13 오류: {ex}')
                             if found is not None:
                                 results.append((i, found))
                             diagnostics.append(f'{name} | 영역 {rect} | 인식: {found is not None}\n' + '\n'.join(attempts))
