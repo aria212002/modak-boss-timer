@@ -1,4 +1,4 @@
-"""MODAK Boss Timer 5.0 Lite — server-only, dependency-free Windows overlay.
+"""MODAK Boss Timer 5.1 Lite — server-only, dependency-free Windows overlay.
 Build with: pyinstaller --onefile --windowed --name ModakBossTimer modak_overlay.py
 """
 import json
@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 import urllib.request
+import uuid
 import winsound
 from pathlib import Path
 import tkinter as tk
@@ -52,6 +53,9 @@ class App:
         self.root = root
         self.data = load_config()
         self.client_id = str(self.data.get('client_id') or '').strip()
+        if not self.client_id:
+            # Per-installation random identifier; never ship a shared client ID.
+            self.client_id = str(uuid.uuid4())
         self.sound = bool(self.data.get('sound_enabled', True))
         self.alpha = float(self.data.get('alpha', .96))
         self.ends = {}
@@ -77,8 +81,8 @@ class App:
             if zone and isinstance(boss.get('end'), (int, float)):
                 self.ends[zone] = boss['end']
         self.root.after(600, self.loop)
-        if not self.client_id:
-            self.root.after(900, self.set_client_id)
+        # Store the generated ID once; no first-run dialog.
+        self.save()
 
     def save(self):
         HOME.mkdir(parents=True, exist_ok=True)
@@ -110,12 +114,12 @@ class App:
         self.status = tk.Label(sub, text='서버 연결 대기 중', fg=MUTED, bg=BG,
                                font=('Malgun Gothic', 9), anchor='w')
         self.status.pack(side='left', padx=(6, 0), fill='x', expand=True)
-        tk.Label(sub, text='v5 LITE', fg=MUTED, bg=BG,
+        tk.Label(sub, text='v5.1 LITE', fg=MUTED, bg=BG,
                  font=('Segoe UI', 9)).pack(side='right')
         actions = tk.Frame(self.root, bg=BG)
         actions.pack(fill='x', padx=15, pady=(0, 10))
         self.make_button(actions, '↻  지금 동기화', self.refresh, bg='#126A70').pack(side='left', padx=(0, 6))
-        self.make_button(actions, '서버 ID', self.set_client_id).pack(side='left', padx=(0, 6))
+        self.make_button(actions, '연결 설정', self.set_client_id).pack(side='left', padx=(0, 6))
         self.sound_button = self.make_button(actions, '', self.toggle_sound)
         self.sound_button.pack(side='left')
         self.update_sound_button()
@@ -165,7 +169,7 @@ class App:
 
     def set_client_id(self):
         value = simpledialog.askstring('서버 클라이언트 ID',
-                                       '게임의 X-Modak-Client-Id 값을 입력하세요.\n이 값은 PC에만 저장됩니다.',
+                                       '자동 생성된 ID로 연결이 안 될 때만\n게임의 X-Modak-Client-Id를 입력하세요.\n(값은 이 PC에만 저장됩니다.)',
                                        initialvalue=self.client_id, parent=self.root)
         if value is None:
             return
@@ -179,9 +183,7 @@ class App:
         self.refresh()
 
     def refresh(self):
-        if self.fetching or not self.client_id:
-            if not self.client_id:
-                self.set_client_id()
+        if self.fetching:
             return
         self.fetching = True
         self.next_fetch = time.monotonic() + 30
@@ -195,7 +197,7 @@ class App:
                 'Accept': 'application/json',
                 'Origin': 'https://modakmmo.com',
                 'Referer': 'https://modakmmo.com/',
-                'User-Agent': 'ModakBossTimer/5.0',
+                'User-Agent': 'ModakBossTimer/5.1',
             })
             started = time.time()
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -264,7 +266,7 @@ class App:
                     self.status.config(text=f'서버 연결됨 · {len(payload)}/8개 동기화')
                     self.indicator.config(fg=CYAN)
                 else:
-                    self.status.config(text='연결 실패 · 이전 시간 유지')
+                    self.status.config(text='연결 실패 · 연결 설정 확인 (이전 시간 유지)')
                     self.indicator.config(fg=RED)
         except queue.Empty:
             pass
