@@ -9,31 +9,34 @@ try:
     import mss
     from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageTk
     import pytesseract
-    bundle_dir = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
-    bundled_ocr = bundle_dir / 'Tesseract-OCR' / 'tesseract.exe'
-    bundled_data = bundle_dir / 'Tesseract-OCR' / 'tessdata'
-    if bundled_ocr.is_file() and (bundled_data / 'eng.traineddata').is_file():
-        os.environ['TESSDATA_PREFIX'] = str(bundled_data)
-        OCR_DATA_DIR = bundled_data
-    else:
-        OCR_DATA_DIR = None
-    candidates = [
-        str(bundled_ocr),
-        shutil.which('tesseract'),
-        r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-        r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
-    ]
-    for executable in candidates:
-        if executable and Path(executable).is_file():
-            pytesseract.pytesseract.tesseract_cmd = str(executable)
-            if OCR_DATA_DIR is None:
-                candidate_data = Path(executable).parent / 'tessdata'
-                if (candidate_data / 'eng.traineddata').is_file():
-                    OCR_DATA_DIR = candidate_data
-                    os.environ['TESSDATA_PREFIX'] = str(candidate_data)
-            break
 except ImportError:
     pytesseract = None
+
+OCR_DATA_DIR = None
+OCR_CONFIG = '--psm 7 -l eng -c tessedit_char_whitelist=0123456789:'
+if pytesseract is not None:
+    # PyInstaller onedir: sys._MEIPASS normally points to the _internal folder.
+    roots = [Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))]
+    if getattr(sys, 'frozen', False):
+        roots += [Path(sys.executable).resolve().parent / '_internal',
+                  Path(sys.executable).resolve().parent]
+    candidates = [root / 'Tesseract-OCR' / 'tesseract.exe' for root in roots]
+    which = shutil.which('tesseract')
+    if which:
+        candidates.append(Path(which))
+    candidates += [Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
+                   Path(r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe')]
+    for executable in candidates:
+        if executable.is_file():
+            pytesseract.pytesseract.tesseract_cmd = str(executable)
+            data_dir = executable.parent / 'tessdata'
+            if (data_dir / 'eng.traineddata').is_file():
+                OCR_DATA_DIR = data_dir
+                # Avoid inherited TESSDATA_PREFIX pointing to the wrong directory.
+                os.environ.pop('TESSDATA_PREFIX', None)
+                # Explicit --tessdata-dir works reliably with bundled Tesseract.
+                OCR_CONFIG += f' --tessdata-dir "{data_dir}"'
+            break
 
 BASE = Path(os.getenv('APPDATA', str(Path.home()))) / 'ModakBossOverlay'
 BASE.mkdir(parents=True, exist_ok=True)
@@ -198,7 +201,7 @@ class App:
                         im=ImageEnhance.Contrast(im).enhance(2.3)
                         candidates=[]
                         for candidate in (im,ImageOps.invert(im)):
-                            raw=pytesseract.image_to_string(candidate,lang='eng',config='--psm 7 -c tessedit_char_whitelist=0123456789:' + (f' --tessdata-dir \"{OCR_DATA_DIR}\"' if OCR_DATA_DIR else ''))
+                            raw=pytesseract.image_to_string(candidate,lang='eng',config=OCR_CONFIG)
                             found=re.findall(r'\d{1,2}:\d{2}(?::\d{2})?',raw)
                             for v in found:
                                 try:candidates.append(seconds(v))
