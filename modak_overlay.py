@@ -72,30 +72,33 @@ def read_ocr(image, psm=7):
         return txt.read_text(encoding='utf-8', errors='replace') if txt.exists() else ''
 
 def ocr_variants(original):
-    """Focus on the small countdown at the top of the boss marker."""
+    """Try top and vertically shifted text strips, preserving tiny white digits."""
     width, height = original.size
-    # In the observed game screenshot, digits occupy the top ~one third.
-    # Also try a taller crop in case the UI scale differs.
-    crops = [
-        ('top35', original.crop((0, 0, width, max(9, round(height * 0.35))))),
-        ('top50', original.crop((0, 0, width, max(12, round(height * 0.50))))),
-        ('full', original),
+    # The countdown can sit at different heights over each region's icon.
+    crop_ranges = [
+        ('top48', 0, round(height * 0.48)),
+        ('shift20', round(height * 0.20), round(height * 0.63)),
+        ('shift25', round(height * 0.25), round(height * 0.70)),
+        ('top60', 0, round(height * 0.60)),
     ]
-    for crop_name, crop in crops:
+    for crop_name, y1, y2 in crop_ranges:
+        y1 = max(0, min(height - 1, y1))
+        y2 = max(y1 + 1, min(height, y2))
+        crop = original.crop((0, y1, width, y2))
         gray = ImageOps.grayscale(crop)
-        scale = 8
-        resized = gray.resize((gray.width * scale, gray.height * scale), Image.Resampling.NEAREST)
-        # Light digit interiors become dark ink on a plain white background.
-        white_ink = resized.point(lambda value: 0 if value >= 205 else 255)
-        # Reduce thin holes and gaps in tiny letters.
-        white_ink = white_ink.filter(ImageFilter.MinFilter(3))
-        dark_ink = resized.point(lambda value: 0 if value <= 85 else 255)
+        # LANCZOS retains the curved shapes of tiny numbers much better
+        # than nearest-neighbor enlargement for this game's text.
+        resized = gray.resize((width * 6, (y2 - y1) * 6), Image.Resampling.LANCZOS)
+        for threshold in (200, 175, 225):
+            digits = resized.point(lambda value, t=threshold: 0 if value >= t else 255)
+            padded = Image.new('L', (digits.width + 64, digits.height + 64), 255)
+            padded.paste(digits, (32, 32))
+            yield f'{crop_name}_white{threshold}', padded
+        # Gray fallback when white-on-dark isolation fails.
         boosted = ImageOps.autocontrast(resized)
-        for kind, image in [('white_digits', white_ink), ('dark_outline', dark_ink), ('gray', boosted)]:
-            # Tesseract performs better with surrounding whitespace.
-            padded = Image.new('L', (image.width + 48, image.height + 48), 255)
-            padded.paste(image, (24, 24))
-            yield f'{crop_name}_{kind}', padded
+        padded = Image.new('L', (boosted.width + 64, boosted.height + 64), 255)
+        padded.paste(boosted, (32, 32))
+        yield f'{crop_name}_gray', padded
 
 
 def extract_countdown(raw):
@@ -130,7 +133,7 @@ def fmt(n):
 
 class App:
     def __init__(self, root):
-        self.root=root; root.title('MODAK BOSS TIMER'); root.attributes('-topmost', True)
+        self.root=root; root.title('MODAK BOSS TIMER - OCR v6'); root.attributes('-topmost', True)
         self.data=self.load(); self.rows={}; self.queue=queue.Queue(); self.scanning=False
         self.alpha=self.data.get('alpha',0.91); root.attributes('-alpha',self.alpha)
         root.geometry(self.data.get('geometry','370x480+70+80'))
@@ -283,6 +286,7 @@ class App:
                             if w <= 0 or h <= 0:
                                 raise ValueError(f'잘못된 영역 크기: {rect}')
                             shot = sct.grab({'left': x, 'top': y, 'width': w, 'height': h})
+                            captured_at = time.time()
                             original = Image.frombytes('RGB', shot.size, shot.rgb)
                             original.save(diag_dir / f'{i+1:02d}_original.png')
                             variants = list(ocr_variants(original))
@@ -301,7 +305,7 @@ class App:
                                     attempts.append(f'{variant_name} psm7 오류: {ex}')
                             # A single text line may work better as raw-line mode.
                             if found is None:
-                                for variant_name, im in variants[:3]:
+                                for variant_name, im in variants[:8]:
                                     try:
                                         raw = read_ocr(im, psm=13).strip()
                                         attempts.append(f'{variant_name} psm13: {raw!r}')
@@ -311,7 +315,7 @@ class App:
                                     except Exception as ex:
                                         attempts.append(f'{variant_name} psm13 오류: {ex}')
                             if found is not None:
-                                results.append((i, found))
+                                results.append((i, captured_at + found))
                             diagnostics.append(f'{name} | 영역 {rect} | 인식: {found is not None}\n' + '\n'.join(attempts))
                         except Exception as ex:
                             diagnostics.append(f'{name} | 캡처 오류: {ex}')
@@ -343,8 +347,8 @@ class App:
                     self.status.config(text='인식 실패: ' + result[1])
                     continue
                 _, values, total, diag_dir = result
-                for i, secs in values:
-                    self.data['bosses'][i]['end'] = time.time() + secs
+                for i, end_time in values:
+                    self.data['bosses'][i]['end'] = end_time
                 self.status.config(text=f'동기화 완료: {len(values)}/{total}개 인식. 진단: {diag_dir}', wraplength=345)
                 self.save()
         except queue.Empty:
