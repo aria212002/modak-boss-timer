@@ -1,1 +1,9 @@
 
+
+name: Build Windows Portable Overlay
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
