@@ -1,4 +1,4 @@
-"""MODAK boss timer 3.0 — map-triggered auto sync and sound alarms.
+"""MODAK boss timer 4.0 — server sync with OCR fallback and alarms.
 Run with Python or package using the existing PyInstaller workflow.
 """
 import json
@@ -12,6 +12,9 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.request
+import urllib.error
+import uuid
 import winsound
 from collections import Counter
 from pathlib import Path
@@ -28,6 +31,16 @@ CONFIG = BASE / 'config.json'
 DIAG = BASE / 'ocr_diagnostics'
 BG = '#17212b'
 FG = '#e7f1fa'
+API_URL = 'https://api.modakmmo.com/api/v1/world-timers'
+SERVER_INTERVAL = 30
+ZONE_IDS = {
+    '그늘숲': 'mistwood', '초원': 'meadow', '황야': 'wasteland',
+    '협곡 진입로': 'skoll_path', '망자의 묘지': 'graveyard',
+    '망국의 기록보관소': 'forgotten_castle_archive',
+    '잊혀진 고성 입구': 'forgotten_castle_entrance',
+    '망국의 병기창': 'forgotten_castle_arsenal',
+}
+
 
 
 def locate_tesseract():
@@ -158,7 +171,7 @@ def recognize(original, executable, data_dir):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title('MODAK BOSS TIMER 3')
+        root.title('MODAK BOSS TIMER 4')
         root.configure(bg=BG)
         root.attributes('-topmost', True)
         self.data = self.load()
@@ -168,7 +181,13 @@ class App:
         self.rows = {}
         self.events = queue.Queue()
         self.busy = False
-        self.auto_enabled = bool(self.data.get('auto_enabled', True))
+        self.auto_enabled = bool(self.data.get('auto_enabled', False))
+        self.server_enabled = bool(self.data.get('server_enabled', True))
+        self.client_id = str(self.data.get('client_id', '')).strip()
+        self.server_busy = False
+        self.next_server_sync = time.monotonic() + 1
+        self.server_offset = 0.0
+        self.server_active = {}
         self.sound_enabled = bool(self.data.get('sound_enabled', True))
         self.map_visible = False
         self.map_hits = 0
@@ -178,6 +197,8 @@ class App:
         self.alarmed = {}  # boss index -> {end timestamp, fired thresholds}
         self.build_ui()
         self.draw_rows()
+        if self.server_enabled and not self.client_id:
+            self.root.after(900, self.configure_client_id)
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(200, self.tick)
 
@@ -196,13 +217,15 @@ class App:
         self.data['alpha'] = self.alpha
         self.data['geometry'] = self.root.geometry()
         self.data['auto_enabled'] = self.auto_enabled
+        self.data['server_enabled'] = self.server_enabled
+        self.data['client_id'] = self.client_id
         self.data['sound_enabled'] = self.sound_enabled
         CONFIG.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def build_ui(self):
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill='x', padx=10, pady=(10, 4))
-        tk.Label(header, text='⚔ MODAK BOSS TIMER 3', bg=BG, fg=FG,
+        tk.Label(header, text='⚔ MODAK BOSS TIMER 4', bg=BG, fg=FG,
                  font=('Malgun Gothic', 12, 'bold')).pack(side='left')
         tk.Button(header, text='−', command=self.root.iconify, width=3).pack(side='right')
         bar = tk.Frame(self.root, bg=BG)
@@ -212,14 +235,21 @@ class App:
             tk.Button(bar, text=label, command=fn,
                       font=('Malgun Gothic', 8)).pack(side='left', padx=2)
         self.status = tk.Label(self.root, bg=BG, fg='#a7c5d9', wraplength=365,
-                               text='자동 감지 대기 중: 월드맵을 열면 자동 동기화합니다.',
+                               text='서버 연결 대기 중 (30초마다 자동 갱신)',
                                font=('Malgun Gothic', 9), justify='left')
         self.status.pack(fill='x', padx=10, pady=(2, 4))
         options = tk.Frame(self.root, bg=BG)
         options.pack(fill='x', padx=10, pady=(0, 4))
         self.auto_var = tk.BooleanVar(value=self.auto_enabled)
+        self.server_var = tk.BooleanVar(value=self.server_enabled)
+        tk.Checkbutton(options, text='서버 자동 동기화', variable=self.server_var,
+                       command=self.toggle_server, bg=BG, fg=FG,
+                       selectcolor='#233140', activebackground=BG,
+                       activeforeground=FG).pack(side='left')
+        tk.Button(options, text='서버 ID 설정', command=self.configure_client_id,
+                  font=('Malgun Gothic', 8)).pack(side='left', padx=3)
         self.sound_var = tk.BooleanVar(value=self.sound_enabled)
-        tk.Checkbutton(options, text='월드맵 자동 감지', variable=self.auto_var,
+        tk.Checkbutton(options, text='월드맵 OCR 감지', variable=self.auto_var,
                        command=self.toggle_auto, bg=BG, fg=FG,
                        selectcolor='#233140', activebackground=BG,
                        activeforeground=FG).pack(side='left')
@@ -246,6 +276,78 @@ class App:
         scale.set(round(self.alpha*100))
         scale.pack(side='left')
         tk.Button(footer, text='설정 저장', command=self.save).pack(side='right')
+
+    def toggle_server(self):
+        self.server_enabled = self.server_var.get()
+        self.next_server_sync = time.monotonic()
+        self.status.config(text='서버 동기화 켜짐' if self.server_enabled else '서버 동기화 꺼짐')
+        self.save()
+
+    def configure_client_id(self):
+        value = simpledialog.askstring('서버 클라이언트 ID',
+            '게임 Network 요청의 X-Modak-Client-Id 값을 입력하세요.\n'
+            '이 값은 이 컴퓨터의 설정 파일에만 저장됩니다.',
+            initialvalue=self.client_id, parent=self.root)
+        if value is None:
+            return
+        value = value.strip()
+        if value:
+            try:
+                uuid.UUID(value)
+            except ValueError:
+                messagebox.showerror('입력 오류', 'UUID 형태의 클라이언트 ID를 입력해 주세요.')
+                return
+        self.client_id = value
+        self.next_server_sync = time.monotonic()
+        self.save()
+        self.status.config(text='서버 ID 저장 완료. 연결을 시도합니다.' if value else '서버 ID가 비어 있습니다.')
+
+    def sync_server(self):
+        if self.server_busy or not self.server_enabled:
+            return
+        if not self.client_id:
+            self.next_server_sync = time.monotonic() + 30
+            self.status.config(text='서버 연결 전: 서버 ID 설정 버튼을 눌러주세요.')
+            return
+        self.server_busy = True
+        self.next_server_sync = time.monotonic() + SERVER_INTERVAL
+        threading.Thread(target=self.server_worker, daemon=True).start()
+
+    def server_worker(self):
+        try:
+            request = urllib.request.Request(API_URL, headers={
+                'X-Modak-Client-Id': self.client_id,
+                'Accept': 'application/json',
+                'Origin': 'https://modakmmo.com',
+                'Referer': 'https://modakmmo.com/',
+                'User-Agent': 'ModakBossTimer/4.0',
+            })
+            start = time.time()
+            with urllib.request.urlopen(request, timeout=10) as response:
+                if response.status != 200:
+                    raise RuntimeError(f'HTTP {response.status}')
+                payload = json.loads(response.read(2_000_000).decode('utf-8'))
+            received = time.time()
+            if not isinstance(payload, dict) or not isinstance(payload.get('timers'), list):
+                raise ValueError('서버 응답에 timers 목록이 없습니다.')
+            server_ms = payload.get('server_time')
+            if not isinstance(server_ms, (int, float)):
+                raise ValueError('서버 시각이 없습니다.')
+            # Estimate server/client clock difference using request midpoint.
+            offset = server_ms / 1000 - (start + received) / 2
+            entries = {}
+            for item in payload['timers']:
+                if not isinstance(item, dict):
+                    continue
+                zone = item.get('zone_id')
+                spawn = item.get('next_spawn_at')
+                if isinstance(zone, str) and isinstance(spawn, (int, float)) and spawn > 0:
+                    entries[zone] = (spawn / 1000 - offset, bool(item.get('active', False)))
+            if not entries:
+                raise ValueError('월드보스 출현 시각이 없습니다.')
+            self.events.put(('server_complete', entries, offset))
+        except Exception as exc:
+            self.events.put(('server_error', str(exc)))
 
     def toggle_auto(self):
         self.auto_enabled = self.auto_var.get()
@@ -598,6 +700,30 @@ class App:
                 event = self.events.get_nowait()
                 if event[0] == 'progress':
                     self.status.config(text=f'시간 인식 중... {event[1]}/{event[2]}개 처리')
+                elif event[0] == 'server_complete':
+                    self.server_busy = False
+                    entries, offset = event[1], event[2]
+                    self.server_offset = offset
+                    updated = 0
+                    for i, boss in enumerate(self.data['bosses']):
+                        zone = ZONE_IDS.get(boss['name'])
+                        if zone not in entries:
+                            continue
+                        new_end, active = entries[zone]
+                        old_end = boss.get('end')
+                        boss['end'] = new_end
+                        self.server_active[i] = active
+                        if old_end is None or abs(old_end - new_end) > 3:
+                            self.alarmed.pop(i, None)
+                            # Suppress alarms on initial sync if threshold already passed.
+                            self._previous_remaining = getattr(self, '_previous_remaining', {})
+                            self._previous_remaining[i] = new_end - time.time()
+                        updated += 1
+                    self.status.config(text=f'서버 동기화 완료: {updated}/8개 · 30초마다 갱신')
+                    self.save()
+                elif event[0] == 'server_error':
+                    self.server_busy = False
+                    self.status.config(text='서버 연결 실패: ' + event[1][:110] + '\n기존 카운트다운 유지')
                 elif event[0] == 'probe':
                     self.handle_probe(event[1])
                 elif event[0] == 'probe_error':
@@ -638,8 +764,10 @@ class App:
                 remain = end-now
                 label.config(text=format_time(remain),
                              fg='#ffd37b' if remain <= 300 else '#c7e7fc')
+        if self.server_enabled and not self.server_busy and time.monotonic() >= self.next_server_sync:
+            self.sync_server()
         # Schedule automatic detection without blocking the Tk UI.
-        if self.auto_enabled and not self.busy and not self.probing and time.monotonic() >= self.next_probe:
+        if self.auto_enabled and not self.server_enabled and not self.busy and not self.probing and time.monotonic() >= self.next_probe:
             self.next_probe = time.monotonic() + 10
             self.probe_map()
         self.check_alarms(now)
