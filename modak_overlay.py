@@ -201,7 +201,12 @@ class App:
                         im=ImageEnhance.Contrast(im).enhance(2.3)
                         candidates=[]
                         for candidate in (im,ImageOps.invert(im)):
-                            raw=pytesseract.image_to_string(candidate,lang='eng',config=OCR_CONFIG)
+                            # Read OCR output as bytes: some Windows Tesseract builds emit
+                            # non-UTF-8 bytes even when recognizing only digits.
+                            raw_bytes = pytesseract.image_to_string(
+                                candidate, lang='eng', config=OCR_CONFIG,
+                                output_type=pytesseract.Output.BYTES)
+                            raw = raw_bytes.decode('utf-8', errors='replace')
                             found=re.findall(r'\d{1,2}:\d{2}(?::\d{2})?',raw)
                             for v in found:
                                 try:candidates.append(seconds(v))
