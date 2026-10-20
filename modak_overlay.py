@@ -2,58 +2,41 @@
 import json, os, re, time, threading, queue, tkinter as tk
 import sys
 import shutil
-import subprocess
-import tempfile
 from tkinter import ttk, messagebox, simpledialog
 from pathlib import Path
 
-import mss
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageTk
+try:
+    import mss
+    from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageTk
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
-# Call Tesseract directly. pytesseract can raise UnicodeDecodeError while
-# decoding Tesseract's Windows stderr before its BYTES option takes effect.
-OCR_EXE = None
 OCR_DATA_DIR = None
-roots = [Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))]
-if getattr(sys, 'frozen', False):
-    roots.extend([Path(sys.executable).resolve().parent / '_internal',
-                  Path(sys.executable).resolve().parent])
-candidates = [root / 'Tesseract-OCR' / 'tesseract.exe' for root in roots]
-which = shutil.which('tesseract')
-if which:
-    candidates.append(Path(which))
-candidates.extend([Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
-                   Path(r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe')])
-for candidate in candidates:
-    if candidate.is_file() and (candidate.parent / 'tessdata' / 'eng.traineddata').is_file():
-        OCR_EXE = candidate
-        OCR_DATA_DIR = candidate.parent / 'tessdata'
-        break
-
-def read_ocr(image):
-    if OCR_EXE is None:
-        raise RuntimeError('Tesseract OCR 또는 eng.traineddata 파일을 찾지 못했습니다.')
-    # Windows temp paths may contain non-ASCII; use the user's current
-    # temp directory, and pass argument arrays rather than quoted strings.
-    with tempfile.TemporaryDirectory(prefix='modak_ocr_') as tempdir:
-        input_path = Path(tempdir) / 'timer.png'
-        image.save(input_path, format='PNG')
-        cmd = [str(OCR_EXE), str(input_path), 'stdout',
-               '--tessdata-dir', str(OCR_DATA_DIR), '-l', 'eng', '--psm', '7',
-               '-c', 'tessedit_char_whitelist=0123456789:']
-        env = os.environ.copy()
-        env.pop('TESSDATA_PREFIX', None)
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        result = subprocess.run(cmd, capture_output=True, text=False,
-                                timeout=20, env=env, startupinfo=startupinfo)
-        if result.returncode != 0:
-            # Windows OCR binaries can emit CP949 stderr, not UTF-8.
-            message = result.stderr.decode('cp949' if os.name == 'nt' else 'utf-8', errors='replace')
-            raise RuntimeError('Tesseract 오류: ' + message[:400])
-        return result.stdout.decode('utf-8', errors='replace')
+OCR_CONFIG = '--psm 7 -l eng -c tessedit_char_whitelist=0123456789:'
+if pytesseract is not None:
+    # PyInstaller onedir: sys._MEIPASS normally points to the _internal folder.
+    roots = [Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))]
+    if getattr(sys, 'frozen', False):
+        roots += [Path(sys.executable).resolve().parent / '_internal',
+                  Path(sys.executable).resolve().parent]
+    candidates = [root / 'Tesseract-OCR' / 'tesseract.exe' for root in roots]
+    which = shutil.which('tesseract')
+    if which:
+        candidates.append(Path(which))
+    candidates += [Path(r'C:\Program Files\Tesseract-OCR\tesseract.exe'),
+                   Path(r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe')]
+    for executable in candidates:
+        if executable.is_file():
+            pytesseract.pytesseract.tesseract_cmd = str(executable)
+            data_dir = executable.parent / 'tessdata'
+            if (data_dir / 'eng.traineddata').is_file():
+                OCR_DATA_DIR = data_dir
+                # Avoid inherited TESSDATA_PREFIX pointing to the wrong directory.
+                os.environ.pop('TESSDATA_PREFIX', None)
+                # Explicit --tessdata-dir works reliably with bundled Tesseract.
+                OCR_CONFIG += f' --tessdata-dir "{data_dir}"'
+            break
 
 BASE = Path(os.getenv('APPDATA', str(Path.home()))) / 'ModakBossOverlay'
 BASE.mkdir(parents=True, exist_ok=True)
@@ -200,34 +183,67 @@ class App:
         except Exception as ex:self.root.deiconify();messagebox.showerror('캡처 오류',str(ex))
 
     def scan(self):
-        if self.scanning:return
+        if self.scanning:
+            return
         targets=[(i,b['rect']) for i,b in enumerate(self.data['bosses']) if b.get('rect')]
-        if not targets:self.status.config(text='먼저 지역별 시간 숫자 영역을 지정하세요.');return
+        if not targets:
+            self.status.config(text='먼저 지역별 시간 숫자 영역을 지정하세요.')
+            return
         if OCR_EXE is None:
             self.status.config(text='Tesseract OCR 파일을 찾지 못했습니다.')
             return
-        self.scanning=True;self.status.config(text='게임 화면에서 시간 인식 중…')
+        self.scanning=True
+        self.status.config(text='시간 인식 중... 실패 시 OCR 진단 파일이 저장됩니다.')
         def work():
             results=[]
+            diagnostics=[]
+            diag_dir=BASE / 'ocr_diagnostics'
+            diag_dir.mkdir(exist_ok=True)
             try:
                 with mss.mss() as sct:
-                    for i,(x,y,w,h) in targets:
-                        shot=sct.grab({'left':int(x),'top':int(y),'width':int(w),'height':int(h)})
-                        im=Image.frombytes('RGB',shot.size,shot.rgb)
-                        im=ImageOps.grayscale(im).resize((max(80,w*5),max(35,h*5)))
-                        im=ImageEnhance.Contrast(im).enhance(2.3)
-                        candidates=[]
-                        for candidate in (im,ImageOps.invert(im)):
-                            raw = read_ocr(candidate)
-                            found=re.findall(r'\d{1,2}:\d{2}(?::\d{2})?',raw)
-                            for v in found:
-                                try:candidates.append(seconds(v))
-                                except ValueError:pass
-                        if candidates:results.append((i,candidates[0]))
-                self.queue.put(('result',results,len(targets)))
+                    for i,rect in targets:
+                        name=self.data['bosses'][i]['name']
+                        x,y,w,h=[int(v) for v in rect]
+                        if w<=0 or h<=0:
+                            diagnostics.append(f'{name}: 영역 크기 오류 {rect}')
+                            continue
+                        shot=sct.grab({'left':x,'top':y,'width':w,'height':h})
+                        original=Image.frombytes('RGB',shot.size,shot.rgb)
+                        gray=ImageOps.grayscale(original)
+                        enlarged=gray.resize((max(160,w*6),max(70,h*6)),Image.Resampling.LANCZOS)
+                        variants=[
+                            ('gray',ImageEnhance.Contrast(enlarged).enhance(2.0)),
+                            ('invert',ImageOps.invert(enlarged)),
+                            ('white_text',enlarged.point(lambda v: 255 if v>=165 else 0)),
+                            ('dark_text',enlarged.point(lambda v: 0 if v>=165 else 255)),
+                        ]
+                        found_values=[]
+                        raw_lines=[]
+                        for variant_name,im in variants:
+                            for psm in (7,13):
+                                try:
+                                    raw=read_ocr(im,psm=psm).strip()
+                                    raw_lines.append(f'{variant_name} psm{psm}: {raw!r}')
+                                    for match in re.findall(r'(?<!\\d)\\d{1,2}:\\d{2}(?::\\d{2})?(?!\\d)',raw):
+                                        try:found_values.append(seconds(match))
+                                        except ValueError:pass
+                                except Exception as ex:
+                                    raw_lines.append(f'{variant_name} psm{psm} 오류: {ex}')
+                        if found_values:
+                            # Favor the first valid result; never invent a countdown.
+                            results.append((i,found_values[0]))
+                        else:
+                            safe=f'{i+1:02d}'
+                            original.save(diag_dir / f'{safe}_original.png')
+                            variants[0][1].save(diag_dir / f'{safe}_processed.png')
+                            diagnostics.append(f'{name}: 영역 {rect}; 캡처 {w}x{h}\\n'+'\\n'.join(raw_lines))
+                (diag_dir/'ocr_report.txt').write_text(
+                    '모닥 OCR 진단 결과\\n'
+                    '실패한 지역의 original.png가 실제 게임 숫자를 보여주는지 확인하세요.\\n\\n'
+                    +'\\n\\n'.join(diagnostics),encoding='utf-8')
+                self.queue.put(('result',results,len(targets),str(diag_dir)))
             except Exception as ex:
-                detail = str(ex)
-                self.queue.put(('error',detail))
+                self.queue.put(('error',str(ex)))
         threading.Thread(target=work,daemon=True).start()
 
     def tick(self):
@@ -235,9 +251,9 @@ class App:
             while True:
                 result=self.queue.get_nowait();self.scanning=False
                 if result[0]=='error':self.status.config(text='인식 실패: '+result[1]);continue
-                _,values,total=result
+                _,values,total,diag_dir=result
                 for i,secs in values:self.data['bosses'][i]['end']=time.time()+secs
-                self.status.config(text=f'동기화 완료: {len(values)}/{total}개 인식 · 잘못 읽힌 시간은 직접 수정하세요.')
+                self.status.config(text=f'동기화 {len(values)}/{total}개 인식. 실패 시 진단 폴더: {diag_dir}',wraplength=345)
                 self.save()
         except queue.Empty:pass
         now=time.time()
