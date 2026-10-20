@@ -1,4 +1,4 @@
-"""MODAK boss timer 2.0 — independent Windows overlay, screen OCR, diagnostics.
+"""MODAK boss timer 3.0 — map-triggered auto sync and sound alarms.
 Run with Python or package using the existing PyInstaller workflow.
 """
 import json
@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import traceback
+import winsound
 from collections import Counter
 from pathlib import Path
 import tkinter as tk
@@ -157,7 +158,7 @@ def recognize(original, executable, data_dir):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title('MODAK BOSS TIMER 2')
+        root.title('MODAK BOSS TIMER 3')
         root.configure(bg=BG)
         root.attributes('-topmost', True)
         self.data = self.load()
@@ -167,6 +168,14 @@ class App:
         self.rows = {}
         self.events = queue.Queue()
         self.busy = False
+        self.auto_enabled = bool(self.data.get('auto_enabled', True))
+        self.sound_enabled = bool(self.data.get('sound_enabled', True))
+        self.map_visible = False
+        self.map_hits = 0
+        self.next_probe = time.monotonic() + 4
+        self.next_auto_sync = 0
+        self.probing = False
+        self.alarmed = {}  # boss index -> {end timestamp, fired thresholds}
         self.build_ui()
         self.draw_rows()
         root.protocol('WM_DELETE_WINDOW', self.close)
@@ -186,12 +195,14 @@ class App:
         BASE.mkdir(parents=True, exist_ok=True)
         self.data['alpha'] = self.alpha
         self.data['geometry'] = self.root.geometry()
+        self.data['auto_enabled'] = self.auto_enabled
+        self.data['sound_enabled'] = self.sound_enabled
         CONFIG.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def build_ui(self):
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill='x', padx=10, pady=(10, 4))
-        tk.Label(header, text='⚔ MODAK BOSS TIMER 2', bg=BG, fg=FG,
+        tk.Label(header, text='⚔ MODAK BOSS TIMER 3', bg=BG, fg=FG,
                  font=('Malgun Gothic', 12, 'bold')).pack(side='left')
         tk.Button(header, text='−', command=self.root.iconify, width=3).pack(side='right')
         bar = tk.Frame(self.root, bg=BG)
@@ -201,9 +212,21 @@ class App:
             tk.Button(bar, text=label, command=fn,
                       font=('Malgun Gothic', 8)).pack(side='left', padx=2)
         self.status = tk.Label(self.root, bg=BG, fg='#a7c5d9', wraplength=365,
-                               text='월드맵을 열고 화면 동기화를 눌러주세요.',
+                               text='자동 감지 대기 중: 월드맵을 열면 자동 동기화합니다.',
                                font=('Malgun Gothic', 9), justify='left')
         self.status.pack(fill='x', padx=10, pady=(2, 4))
+        options = tk.Frame(self.root, bg=BG)
+        options.pack(fill='x', padx=10, pady=(0, 4))
+        self.auto_var = tk.BooleanVar(value=self.auto_enabled)
+        self.sound_var = tk.BooleanVar(value=self.sound_enabled)
+        tk.Checkbutton(options, text='월드맵 자동 감지', variable=self.auto_var,
+                       command=self.toggle_auto, bg=BG, fg=FG,
+                       selectcolor='#233140', activebackground=BG,
+                       activeforeground=FG).pack(side='left')
+        tk.Checkbutton(options, text='알람음', variable=self.sound_var,
+                       command=self.toggle_sound, bg=BG, fg=FG,
+                       selectcolor='#233140', activebackground=BG,
+                       activeforeground=FG).pack(side='left', padx=9)
         panel = tk.Frame(self.root, bg=BG)
         panel.pack(fill='both', expand=True, padx=8)
         self.canvas = tk.Canvas(panel, bg=BG, highlightthickness=0)
@@ -223,6 +246,18 @@ class App:
         scale.set(round(self.alpha*100))
         scale.pack(side='left')
         tk.Button(footer, text='설정 저장', command=self.save).pack(side='right')
+
+    def toggle_auto(self):
+        self.auto_enabled = self.auto_var.get()
+        self.map_visible = False
+        self.map_hits = 0
+        self.next_probe = time.monotonic() + 1
+        self.status.config(text='자동 감지 켜짐' if self.auto_enabled else '자동 감지 꺼짐')
+        self.save()
+
+    def toggle_sound(self):
+        self.sound_enabled = self.sound_var.get()
+        self.save()
 
     def opacity(self, value):
         self.alpha = int(value)/100
@@ -280,6 +315,7 @@ class App:
         except ValueError as exc:
             messagebox.showerror('입력 오류', str(exc))
             return
+        self.alarmed.pop(index, None)
         self.status.config(text=boss['name']+' 수동 입력 완료')
         self.save()
 
@@ -413,6 +449,119 @@ class App:
             self.busy = False
             self.status.config(text='캡처 오류: '+str(exc))
 
+    def probe_map(self):
+        # Map-open detection requires TWO independently recognized timer fields.
+        # This is an OCR-based detector, not a game API; it may miss some openings.
+        if self.busy or self.probing or not self.auto_enabled:
+            return
+        targets = [(i, tuple(map(int, b['rect'])))
+                   for i, b in enumerate(self.data['bosses']) if b.get('rect')]
+        if len(targets) < 2:
+            return
+        executable, data_dir = locate_tesseract()
+        if executable is None:
+            self.status.config(text='자동 감지: Tesseract를 찾지 못했습니다.')
+            self.next_probe = time.monotonic() + 30
+            return
+        # Capture only two compact, previously reliable areas. Never OCR overlay pixels.
+        # Keep detection lightweight and do not modify countdowns during probes.
+        preferred = [0, 1, 3, 5, 6, 7]
+        selected = sorted(targets, key=lambda pair: preferred.index(pair[0])
+                          if pair[0] in preferred else 99)[:2]
+        self.probing = True
+        # Hiding for ~200ms prevents overlay from contaminating screen capture.
+        self.root.withdraw()
+        self.root.after(220, lambda: self.capture_probe(selected, executable, data_dir))
+
+    def capture_probe(self, selected, executable, data_dir):
+        try:
+            samples = []
+            with mss.mss() as sct:
+                for _, (x, y, w, h) in selected:
+                    shot = sct.grab({'left': x, 'top': y, 'width': w, 'height': h})
+                    samples.append(Image.frombytes('RGB', shot.size, shot.rgb))
+            self.root.deiconify()
+            threading.Thread(target=self.probe_worker,
+                             args=(samples, executable, data_dir), daemon=True).start()
+        except Exception as exc:
+            self.root.deiconify()
+            self.probing = False
+            self.next_probe = time.monotonic() + 10
+            self.status.config(text='지도 감지 오류: ' + str(exc))
+
+    def probe_worker(self, samples, executable, data_dir):
+        recognized = 0
+        try:
+            for image in samples:
+                # Only a few known-good preprocessings are needed for map detection.
+                for idx, (_, variant) in enumerate(variants(image)):
+                    if idx >= 3:
+                        break
+                    if extract_times(ocr_image(variant, executable, data_dir)):
+                        recognized += 1
+                        break
+            self.events.put(('probe', recognized == len(samples)))
+        except Exception as exc:
+            self.events.put(('probe_error', str(exc)))
+
+    def handle_probe(self, detected):
+        self.probing = False
+        now = time.monotonic()
+        if not self.auto_enabled:
+            return
+        if detected:
+            self.map_hits += 1
+            # A single full pair of OCR readings is evidence of a visible map.
+            if not self.map_visible:
+                self.map_visible = True
+                self.next_auto_sync = now
+            if not self.busy and now >= self.next_auto_sync:
+                self.next_auto_sync = now + 30
+                self.sync()
+        else:
+            self.map_hits = 0
+            self.map_visible = False
+        self.next_probe = now + (30 if detected else 5)
+
+    def alarm_worker(self, level, name):
+        # Native Windows audio: no sound file or new dependency needed.
+        try:
+            pattern = {300: [(740, 160), (0, 100), (740, 160)],
+                       60: [(900, 220), (0, 100), (900, 220), (0, 100), (900, 220)],
+                       0: [(1050, 330), (0, 130), (1050, 330), (0, 130), (1050, 500)]}[level]
+            for frequency, duration in pattern:
+                if frequency:
+                    winsound.Beep(frequency, duration)
+                else:
+                    time.sleep(duration / 1000)
+        except Exception:
+            try:
+                winsound.MessageBeep()
+            except Exception:
+                pass
+
+    def check_alarms(self, now):
+        for index, boss in enumerate(self.data['bosses']):
+            end = boss.get('end')
+            if end is None:
+                continue
+            state = self.alarmed.get(index)
+            if state is None or abs(state[0] - end) > 3:
+                state = [end, set()]
+                self.alarmed[index] = state
+            remaining = end - now
+            # Avoid firing alerts for stale countdowns loaded after their thresholds.
+            previous = getattr(self, '_previous_remaining', {}).get(index)
+            if previous is None:
+                continue
+            for threshold in (300, 60, 0):
+                if self.sound_enabled and threshold not in state[1] and previous > threshold >= remaining:
+                    state[1].add(threshold)
+                    threading.Thread(target=self.alarm_worker,
+                                     args=(threshold, boss['name']), daemon=True).start()
+        self._previous_remaining = {i: b['end'] - now for i, b in enumerate(self.data['bosses'])
+                                    if b.get('end') is not None}
+
     def worker(self, captures, executable, data_dir, captured_at):
         results = []
         reports = ['모닥 월드보스 OCR 2.0 진단', '']
@@ -449,6 +598,12 @@ class App:
                 event = self.events.get_nowait()
                 if event[0] == 'progress':
                     self.status.config(text=f'시간 인식 중... {event[1]}/{event[2]}개 처리')
+                elif event[0] == 'probe':
+                    self.handle_probe(event[1])
+                elif event[0] == 'probe_error':
+                    self.probing = False
+                    self.map_visible = False
+                    self.next_probe = time.monotonic() + 10
                 elif event[0] == 'error':
                     self.busy = False
                     self.status.config(text='동기화 오류: '+event[1])
@@ -458,9 +613,14 @@ class App:
                     success = 0
                     for index, seconds in results:
                         if seconds is not None:
-                            self.data['bosses'][index]['end'] = captured_at + seconds
+                            new_end = captured_at + seconds
+                            old_end = self.data['bosses'][index].get('end')
+                            self.data['bosses'][index]['end'] = new_end
+                            if old_end is None or abs(old_end - new_end) > 3:
+                                self.alarmed.pop(index, None)
                             success += 1
                     self.status.config(text=f'동기화 완료: {success}/{len(results)}개 인식\n진단: {DIAG}')
+                    self.next_auto_sync = time.monotonic() + 30
                     self.save()
         except queue.Empty:
             pass
@@ -478,6 +638,11 @@ class App:
                 remain = end-now
                 label.config(text=format_time(remain),
                              fg='#ffd37b' if remain <= 300 else '#c7e7fc')
+        # Schedule automatic detection without blocking the Tk UI.
+        if self.auto_enabled and not self.busy and not self.probing and time.monotonic() >= self.next_probe:
+            self.next_probe = time.monotonic() + 10
+            self.probe_map()
+        self.check_alarms(now)
         self.root.after(400, self.tick)
 
     def close(self):
