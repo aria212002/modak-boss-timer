@@ -21,6 +21,7 @@ ZONES = [
     ('협곡 진입로', 'skoll_path'), ('망자의 묘지', 'graveyard'),
     ('망국의 기록보관소', 'forgotten_castle_archive'),
     ('잊혀진 고성 입구', 'forgotten_castle_entrance'),
+    ('수호자의 안식처', 'eldergrove'),
     ('망국의 병기창', 'forgotten_castle_arsenal'),
 ]
 BG = '#0B1220'
