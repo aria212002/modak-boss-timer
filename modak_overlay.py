@@ -23,6 +23,7 @@ ZONES = [
     ('망국의 기록보관소', 'forgotten_castle_archive'),
     ('협곡 진입로', 'skoll_path'), 
     ('수호자의 안식처', 'eldergrove'),
+    ('붉은숲 피난처', 'crimson_refuge'),
     ('망국의 병기창', 'forgotten_castle_arsenal'),
 ]
 BG = '#0B1220'
@@ -265,7 +266,7 @@ class App:
                         self.ends[zone] = end
                         self.active[zone] = active
                     self.last_success = now
-                    self.status.config(text=f'서버 연결됨 · {len(payload)}/8개 동기화')
+                    self.status.config(text=f'서버 연결됨 · {len(payload)}/10개 동기화')
                     self.indicator.config(fg=CYAN)
                 else:
                     self.status.config(text='연결 실패 · 연결 설정 확인 (이전 시간 유지)')
